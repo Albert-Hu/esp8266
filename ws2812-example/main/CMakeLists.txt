@@ -1,3 +1,3 @@
-set(COMPONENT_SRCS "spi_master_example_main.c")
+set(COMPONENT_SRCS "ws2812.c main.c")
 
 register_component()
