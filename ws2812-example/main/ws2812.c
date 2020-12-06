@@ -1,126 +1,108 @@
-#include <stdlib.h>
+#include <stdio.h>
+#include <math.h>
 #include <string.h>
-
-#include "esp8266/spi_struct.h"
-#include "driver/spi.h"
-
+#include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/i2s.h"
+#include "esp_system.h"
+#include "esp8266/pin_mux_register.h"
 #include "ws2812.h"
 
-#define R(bitmap) (((bitmap) & 0xff0000) >> 16)
-#define G(bitmap) (((bitmap) & 0xff00) >> 8)
-#define B(bitmap) ((bitmap) & 0xff)
+#define SAMPLE_RATE (100000)
+#define I2S_NUM (0)
+#define I2S_BCK_EN (0)
+#define I2S_WS_EN (0)
+#define I2S_DO_EN (1)
+#define I2S_DI_EN (0)
 
-static void _reverse_byte_order(uint32_t *data, size_t len) {
-  while (len-- > 0) {
-    *data = ((*data & 0xff000000) >> 24)
-          + ((*data & 0x00ff0000) >> 8)
-          + ((*data & 0x0000ff00) << 8)
-          + ((*data & 0x000000ff) << 24);
-    data++;
-  }
+struct __attribute__ ((packed)) pixel_buf {
+  uint8_t bytes[12]; /* 1 pixel in 12 bytes */
+};
+
+static uint8_t _bit_patterns[4] = {
+  0x88, // b1000_1000, b00
+  0x8c, // b1000_1100, b01
+  0xc8, // b1100_1000, b10
+  0xcc  // b1100_1100, b11
+};
+
+void _set_buf(uint8_t bitmap, uint8_t *buf) {
+  buf[0] = _bit_patterns[(bitmap >> 6) & 0x03];
+  buf[1] = _bit_patterns[(bitmap >> 4) & 0x03];
+  buf[2] = _bit_patterns[(bitmap >> 2) & 0x03];
+  buf[3] = _bit_patterns[bitmap & 0x03];
 }
 
-static void _convert(uint8_t *bytes, uint8_t bitmap) {
-  uint8_t mask = 0x80;
-  
-  while (mask) {
-    /*
-      0xfc = b11111100, set bit to 1
-      0xc0 = b11000000, set bit to 0
-    */
-    *bytes++ = (bitmap & mask) ? 0xfc : 0xc0;
-    mask >>= 1;
-  }
+void _set_pixel(struct ws2812_pixel *pixel, struct pixel_buf *buf) {
+  /*
+    The order of color of ws2812 is GRB
+  */
+  _set_buf(pixel->g, &buf->bytes[0]);
+  _set_buf(pixel->r, &buf->bytes[4]);
+  _set_buf(pixel->b, &buf->bytes[8]);
 }
 
-int _set_pixel(uint32_t pixel) {
-  uint8_t pixel_bytes[24];
-  spi_trans_t trans;
+int ws2812_set_pixels(struct ws2812_pixel *pixels, size_t num) {
+  int result = ESP_OK;
+  size_t i, i2s_bytes_write = 0;
+  const size_t buf_size = sizeof(struct pixel_buf) * num;
+  struct pixel_buf *buf = NULL;
 
-  memset(&trans, 0, sizeof(spi_trans_t));
+  do {
+    if (!(buf = (struct pixel_buf*) malloc(buf_size))) {
+      result = -1;
+      break;
+    }
 
-  _convert(pixel_bytes, G(pixel));
-  _convert(pixel_bytes + 8, R(pixel));
-  _convert(pixel_bytes + 16, B(pixel));
+    memset(buf, 0, buf_size);
 
-  _reverse_byte_order((uint32_t*) pixel_bytes, 6);
+    for (i = 0; i < num; i++) {
+      _set_pixel(&pixels[i], &buf[i]);
+    }
 
-  trans.mosi = (uint32_t*) pixel_bytes;
-  trans.bits.mosi = 24 * 8;
+    result = i2s_write(I2S_NUM, buf, buf_size, &i2s_bytes_write, 100);
+    if (result != ESP_OK) break;
 
-  return spi_trans(HSPI_HOST, trans);
-}
+    printf("%d bytes has written.\n", i2s_bytes_write);
 
-int ws2812_reset() {
-  uint32_t empty = 0;
-  spi_trans_t trans;
+    i2s_zero_dma_buffer(I2S_NUM);
 
-  memset(&trans, 0, sizeof(spi_trans_t));
-  trans.mosi = &empty;
-  trans.bits.mosi = 8;
+    free(buf);
+  } while (0);
 
-  return spi_trans(HSPI_HOST, trans);
-}
+  if (buf) free(buf);
 
-int ws2812_set_pixels(uint32_t *pixels, uint32_t len) {
-  uint32_t i, offset;
-  uint8_t *pixel_bytes = NULL;
-  spi_trans_t trans;
-
-  if (!(pixel_bytes = (uint8_t*) malloc(len * 24))) {
-    return -1;
-  }
-
-  memset(&trans, 0, sizeof(spi_trans_t));
-  trans.bits.mosi = 8 * 24;
-
-  for (i = 0; i < len; i++) {
-    offset = i * 24;
-    _convert(pixel_bytes + offset, G(pixels[i]));
-    _convert(pixel_bytes + offset + 8, R(pixels[i]));
-    _convert(pixel_bytes + offset + 16, B(pixels[i]));
-    _reverse_byte_order((uint32_t*) (pixel_bytes + offset), 6);
-    trans.mosi = (uint32_t*) (pixel_bytes + offset);
-    spi_trans(HSPI_HOST, trans);
-  }
-
-  free(pixel_bytes);
-
-  return 0;
+  return result;
 }
 
 int ws2812_init() {
-  spi_config_t spi_config;
+  /*
+    Sample Rate: 200k
+    Bits per Sample: 16
+    Bit Rate: 3.2 Mbps
+  */
+  int result = ESP_OK;
+  i2s_config_t i2s_config = {
+      .mode = I2S_MODE_MASTER | I2S_MODE_TX, // Only TX
+      .sample_rate = SAMPLE_RATE,
+      .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+      .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT, // 2-channels
+      .communication_format = I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB,
+      .dma_buf_count = 4,
+      .dma_buf_len = 96};
+  i2s_pin_config_t pin_config = {.bck_o_en = I2S_BCK_EN,
+                                 .ws_o_en = I2S_WS_EN,
+                                 .data_out_en = I2S_DO_EN,
+                                 .data_in_en = I2S_DI_EN};
 
-  // Load default interface parameters
-  // CS_EN:1, MISO_EN:1, MOSI_EN:1, BYTE_TX_ORDER:1, BYTE_TX_ORDER:1,
-  // BIT_RX_ORDER:0, BIT_TX_ORDER:0, CPHA:0, CPOL:0
-  spi_config.interface.val = SPI_DEFAULT_INTERFACE;
+  do {
+    result = i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
+    if (result != ESP_OK) break;
 
-  // Load default interrupt enable
-  // TRANS_DONE: true, WRITE_STATUS: false, READ_STATUS: false, WRITE_BUFFER:
-  // false, READ_BUFFER: false
-  spi_config.intr_enable.val = SPI_MASTER_DEFAULT_INTR_ENABLE;
+    result = i2s_set_pin(I2S_NUM, &pin_config);
+    if (result != ESP_OK) break;
+  } while (0);
 
-  // Cancel hardware cs
-  spi_config.interface.cs_en = 0;
-
-  // MISO pin is used for DC
-  spi_config.interface.miso_en = 0;
-
-  // CPOL: 1, CPHA: 1
-  spi_config.interface.cpol = 1;
-  spi_config.interface.cpha = 1;
-
-  // Set SPI to master mode
-  // 8266 Only support half-duplex
-  spi_config.mode = SPI_MASTER_MODE;
-
-  // Set the SPI clock frequency division factor
-  spi_config.clk_div = SPI_8MHz_DIV;
-
-  // Register SPI event callback function
-  spi_config.event_cb = NULL;
-  
-  return spi_init(HSPI_HOST, &spi_config);
+  return result;
 }

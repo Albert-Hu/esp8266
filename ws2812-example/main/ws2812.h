@@ -3,10 +3,13 @@
 
 #include <stdint.h>
 
-#define COLOR(r, g, b) (((r & 0xff) << 16) + ((g & 0xff) << 8) + (b & 0xff))
+struct ws2812_pixel {
+  uint8_t r;
+  uint8_t g;
+  uint8_t b;
+};
 
+int ws2812_set_pixels(struct ws2812_pixel *pixels, size_t num);
 int ws2812_init();
-int ws2812_reset();
-int ws2812_set_pixels(uint32_t *pixels, uint32_t len);
 
 #endif /* _WS2812_H_ */
